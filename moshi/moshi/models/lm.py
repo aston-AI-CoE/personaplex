@@ -36,6 +36,7 @@ from os.path import splitext
 import logging
 import numpy as np
 import sys
+import time
 from typing import Optional, Union, List, Tuple, Callable, Iterator
 import sphn
 import torch
@@ -721,6 +722,8 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
+        self._step_timing_count = 0
+
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
     
     @torch.no_grad()
@@ -815,18 +818,26 @@ class LMGen(StreamingModule[_LMGenState]):
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
              return_embeddings: bool=False) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        _do_timing = getattr(self, '_step_timing_count', -1)
+        _log_step = 0 <= _do_timing < 3
+
         state = self._streaming_state
         lm_model = self.lm_model
+
+        if _log_step:
+            t_step_start = time.monotonic()
+
         prepared_inputs = self.prepare_step_input(
             input_tokens, moshi_tokens, text_token,
         )
-        # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
-        # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG
         if prepared_inputs is None:
             return (None, None) if self.report_loss or self.return_logits else None
         input_, provided_, target_, model_input_position, target_position = prepared_inputs
+
+        if _log_step:
+            t_after_prepare = time.monotonic()
+
         if self.check:
-            # Check that we are not feeding in any value that is not generated yet.
             assert not (input_ == lm_model.ungenerated_token_id).any(), (
                 state.offset,
                 input_,
@@ -837,6 +848,12 @@ class LMGen(StreamingModule[_LMGenState]):
         if return_embeddings:
             embeddings = self.lm_model.embed_codes(input_)
         transformer_out, text_logits = state.graphed_main(input_)
+
+        if _log_step:
+            if lm_model.device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_after_transformer = time.monotonic()
+
         output = self.process_transformer_output(
             transformer_out,
             text_logits,
@@ -845,6 +862,21 @@ class LMGen(StreamingModule[_LMGenState]):
             model_input_position,
             target_position,
         )
+
+        if _log_step:
+            if lm_model.device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_after_depformer = time.monotonic()
+            print(
+                f"[TIMING]     step[{_do_timing}]: "
+                f"prepare={( t_after_prepare - t_step_start) * 1000:.2f}ms "
+                f"transformer={(t_after_transformer - t_after_prepare) * 1000:.2f}ms "
+                f"depformer={(t_after_depformer - t_after_transformer) * 1000:.2f}ms "
+                f"total={(t_after_depformer - t_step_start) * 1000:.2f}ms",
+                flush=True
+            )
+            self._step_timing_count += 1
+
         if return_embeddings:
             return output, embeddings
         return output
@@ -1067,7 +1099,9 @@ class LMGen(StreamingModule[_LMGenState]):
             pass
 
     async def _step_voice_prompt_async(self, mimi, is_alive: Optional[Callable]=None):
+        self._voice_prompt_frame_count = 0
         for _ in self._step_voice_prompt_core(mimi):
+            self._voice_prompt_frame_count += 1
             if is_alive is not None and not await is_alive():
                 break
 
@@ -1115,10 +1149,29 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
+        t0 = time.monotonic()
         await self._step_voice_prompt_async(mimi, is_alive)
+        t_voice = time.monotonic() - t0
+        voice_frames = getattr(self, '_voice_prompt_frame_count', 0)
+        avg_voice = (t_voice * 1000 / voice_frames) if voice_frames > 0 else 0
+        print(f"[TIMING]   voice_prompt_prefill: {t_voice * 1000:.1f}ms ({voice_frames} frames, {avg_voice:.1f}ms/frame)", flush=True)
+
+        t0 = time.monotonic()
         await self._step_audio_silence_async(is_alive)
+        t_sil1 = time.monotonic() - t0
+        print(f"[TIMING]   silence_1: {t_sil1 * 1000:.1f}ms ({self.audio_silence_frame_cnt} frames)", flush=True)
+
+        t0 = time.monotonic()
         await self._step_text_prompt_async(is_alive)
+        t_text = time.monotonic() - t0
+        num_tokens = len(self.text_prompt_tokens) if self.text_prompt_tokens else 0
+        avg_text = (t_text * 1000 / num_tokens) if num_tokens > 0 else 0
+        print(f"[TIMING]   text_prompt_prefill: {t_text * 1000:.1f}ms ({num_tokens} tokens, {avg_text:.1f}ms/token)", flush=True)
+
+        t0 = time.monotonic()
         await self._step_audio_silence_async(is_alive)
+        t_sil2 = time.monotonic() - t0
+        print(f"[TIMING]   silence_2: {t_sil2 * 1000:.1f}ms ({self.audio_silence_frame_cnt} frames)", flush=True)
 
     def step_system_prompts(self, mimi):
         self._step_voice_prompt(mimi)

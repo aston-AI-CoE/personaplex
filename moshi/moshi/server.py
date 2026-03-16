@@ -52,6 +52,7 @@ from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
+setup_logger("moshi.models.lm")
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
@@ -133,6 +134,8 @@ class ServerState:
 
 
     async def handle_chat(self, request):
+        t_cold_start = time.monotonic()
+
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         clog = ColorizedLog.randomize()
@@ -140,10 +143,10 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
-        # self.lm_gen.temp = float(request.query["audio_temperature"])
-        # self.lm_gen.temp_text = float(request.query["text_temperature"])
-        # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
-        # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
+        self.lm_gen.temp = float(request.query.get("audio_temperature", "0.8"))
+        self.lm_gen.temp_text = float(request.query.get("text_temperature", "0.7"))
+        self.lm_gen.top_k_text = max(1, int(request.query.get("text_topk", "25")))
+        self.lm_gen.top_k = max(1, int(request.query.get("audio_topk", "250")))
         
         # Construct full voice prompt path
         requested_voice_prompt_path = None
@@ -160,14 +163,22 @@ class ServerState:
                 )
             else:
                 voice_prompt_path = requested_voice_prompt_path
-                
+
+        t0 = time.monotonic()
         if self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):
-                # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
+        t_voice_load = time.monotonic() - t0
+        logger.info(f"[TIMING] voice_prompt_load: {t_voice_load * 1000:.1f}ms")
+
+        t0 = time.monotonic()
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+        t_tokenize = time.monotonic() - t0
+        num_text_tokens = len(self.lm_gen.text_prompt_tokens) if self.lm_gen.text_prompt_tokens else 0
+        logger.info(f"[TIMING] text_tokenize: {t_tokenize * 1000:.1f}ms ({num_text_tokens} tokens)")
+
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
@@ -256,36 +267,52 @@ class ServerState:
         if len(request.query["voice_prompt"]) > 0:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
+        t_lock_wait = time.monotonic()
         async with self.lock:
+            t_lock_acquired = time.monotonic()
+            logger.info(f"[TIMING] lock_acquire: {(t_lock_acquired - t_lock_wait) * 1000:.1f}ms")
+
             if seed is not None and seed != -1:
                 seed_all(seed)
 
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+
+            t0 = time.monotonic()
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+            t_reset = time.monotonic() - t0
+            logger.info(f"[TIMING] streaming_reset: {t_reset * 1000:.1f}ms")
+
             async def is_alive():
                 if close or ws.closed:
                     return False
                 try:
-                    # Check for disconnect without waiting too long
                     msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
                     if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         return False
                 except asyncio.TimeoutError:
-                    # No messages → client probably still alive
                     return True
                 except aiohttp.ClientConnectionError:
                     return False
                 return True
-            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+
+            t0 = time.monotonic()
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            t_system_prompts = time.monotonic() - t0
+            logger.info(f"[TIMING] system_prompts_total: {t_system_prompts * 1000:.1f}ms")
+
+            t0 = time.monotonic()
             self.mimi.reset_streaming()
+            t_mimi_reset = time.monotonic() - t0
+            logger.info(f"[TIMING] mimi_post_reset: {t_mimi_reset * 1000:.1f}ms")
+
             clog.log("info", "done with system prompts")
-            # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
+                t_handshake = time.monotonic()
+                logger.info(f"[TIMING] total_cold_start: {(t_handshake - t_cold_start) * 1000:.1f}ms")
                 clog.log("info", "sent handshake bytes")
                 # Clean cancellation manager
                 tasks = [
