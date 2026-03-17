@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
+from .modules.streaming import load_streaming_state
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -97,7 +99,7 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, snapshot_dir: str | None = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -116,7 +118,55 @@ class ServerState:
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
-    
+
+        self._snapshot_cache: dict[str, dict] = {}
+        self._snapshot_configs: list[dict] = []
+
+        if snapshot_dir is not None:
+            self._load_snapshots(snapshot_dir)
+
+    def _load_snapshots(self, snapshot_dir: str):
+        import hashlib
+        dirs_to_scan = [snapshot_dir]
+        for entry in sorted(os.listdir(snapshot_dir)):
+            sub = os.path.join(snapshot_dir, entry)
+            if os.path.isdir(sub):
+                dirs_to_scan.append(sub)
+
+        t0_all = time.monotonic()
+        for scan_dir in dirs_to_scan:
+            snapshot_path = os.path.join(scan_dir, "snapshot.safetensors")
+            metadata_path = os.path.join(scan_dir, "snapshot_metadata.json")
+            config_path = os.path.join(scan_dir, "snapshot_config.json")
+            if not (os.path.exists(snapshot_path) and os.path.exists(metadata_path)):
+                continue
+
+            config = {}
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    config = json.load(f)
+
+            voice = config.get("voice_prompt", "")
+            text_hash = config.get("text_prompt_hash",
+                                   hashlib.sha256(config.get("text_prompt", "").encode()).hexdigest())
+            cache_key = f"{voice}:{text_hash}"
+
+            t0 = time.monotonic()
+            snapshot = load_streaming_state(snapshot_path, metadata_path, device='cpu')
+            snapshot = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in snapshot.items()
+            }
+            t_load = time.monotonic() - t0
+
+            self._snapshot_cache[cache_key] = snapshot
+            self._snapshot_configs.append(config)
+            logger.info(f"[SNAPSHOT] Loaded '{voice}' in {t_load*1000:.0f}ms "
+                        f"(tokens={config.get('num_text_tokens')}, offset={config.get('offset_after_prefill')})")
+
+        t_total = time.monotonic() - t0_all
+        logger.info(f"[SNAPSHOT] {len(self._snapshot_cache)} snapshot(s) ready in {t_total*1000:.0f}ms")
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
@@ -298,15 +348,39 @@ class ServerState:
                     return False
                 return True
 
-            t0 = time.monotonic()
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
-            t_system_prompts = time.monotonic() - t0
-            logger.info(f"[TIMING] system_prompts_total: {t_system_prompts * 1000:.1f}ms")
+            import hashlib as _hl
+            _voice_key = os.path.basename(voice_prompt_path) if voice_prompt_path else ""
+            _text_key = _hl.sha256(request.query.get("text_prompt", "").encode()).hexdigest()
+            matched = self._snapshot_cache.get(f"{_voice_key}:{_text_key}")
 
-            t0 = time.monotonic()
-            self.mimi.reset_streaming()
-            t_mimi_reset = time.monotonic() - t0
-            logger.info(f"[TIMING] mimi_post_reset: {t_mimi_reset * 1000:.1f}ms")
+            if matched is not None:
+                t0 = time.monotonic()
+                snapshot_copy = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                                 for k, v in matched.items()}
+                t_clone = time.monotonic() - t0
+                logger.info(f"[TIMING] snapshot_clone: {t_clone * 1000:.1f}ms")
+
+                t0 = time.monotonic()
+                self.lm_gen.set_streaming_state_inplace(snapshot_copy)
+                t_restore = time.monotonic() - t0
+                logger.info(f"[TIMING] snapshot_restore: {t_restore * 1000:.1f}ms")
+
+                t0 = time.monotonic()
+                self.mimi.reset_streaming()
+                t_mimi_reset = time.monotonic() - t0
+                logger.info(f"[TIMING] mimi_post_reset: {t_mimi_reset * 1000:.1f}ms")
+
+                logger.info(f"[TIMING] total_cold_start_snapshot: {(time.monotonic() - t_cold_start) * 1000:.1f}ms")
+            else:
+                t0 = time.monotonic()
+                await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+                t_system_prompts = time.monotonic() - t0
+                logger.info(f"[TIMING] system_prompts_total: {t_system_prompts * 1000:.1f}ms")
+
+                t0 = time.monotonic()
+                self.mimi.reset_streaming()
+                t_mimi_reset = time.monotonic() - t0
+                logger.info(f"[TIMING] mimi_post_reset: {t_mimi_reset * 1000:.1f}ms")
 
             clog.log("info", "done with system prompts")
             if await is_alive():
@@ -410,6 +484,16 @@ def main():
         )
     )
     parser.add_argument(
+        "--snapshot-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing pre-computed KV cache snapshot files "
+            "(snapshot.safetensors, snapshot_metadata.json, snapshot_config.json). "
+            "If provided, sessions will restore from snapshot instead of running full prefill."
+        )
+    )
+    parser.add_argument(
         "--ssl",
         type=str,
         help=(
@@ -480,14 +564,31 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        snapshot_dir=args.snapshot_dir,
     )
     logger.info("warming up the model")
     state.warmup()
+    async def handle_scenarios(_request):
+        scenarios = []
+        for config in state._snapshot_configs:
+            scenarios.append({
+                "voice_prompt": config.get("voice_prompt", ""),
+                "text_prompt": config.get("text_prompt", ""),
+                "label": config.get("label", ""),
+                "description": config.get("description", ""),
+                "icon": config.get("icon", ""),
+                "num_text_tokens": config.get("num_text_tokens", 0),
+            })
+        return web.json_response(scenarios)
+
     app = web.Application()
+    app.router.add_get("/api/scenarios", handle_scenarios)
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
         async def handle_root(_):
-            return web.FileResponse(os.path.join(static_path, "index.html"))
+            resp = web.FileResponse(os.path.join(static_path, "index.html"))
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            return resp
 
         logger.info(f"serving static content from {static_path}")
         app.router.add_get("/", handle_root)
@@ -506,5 +607,6 @@ def main():
     web.run_app(app, port=args.port, ssl_context=ssl_context)
 
 
-with torch.no_grad():
-    main()
+if __name__ == "__main__":
+    with torch.no_grad():
+        main()

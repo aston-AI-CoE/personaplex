@@ -64,8 +64,9 @@ sequenceDiagram
 
 All values below are estimates unless marked as "measured."
 
-**1. Snapshot restore: ~50-200ms** (depends on storage tier; 0ms if pre-warmed before user connects)
-- `tensor.copy_()` of KV cache state from snapshot buffer to active streaming state
+**1. Snapshot restore: ~520ms** (**measured**, unpinned CPU RAM path; 0ms if pre-warmed before user connects)
+- Clone pinned tensors (~210ms) + `tensor.copy_()` CPU→GPU (~300ms) + overhead
+- See [doc 05](05_kv-cache-snapshot-implementation-results.md) for breakdown
 
 **2. Client mic capture + Opus encode: ~80ms** (from code inspection)
 - `opus-recorder` config in `useUserAudio.ts`:
@@ -98,23 +99,29 @@ All values below are estimates unless marked as "measured."
 
 ## TTFT Estimates
 
+Post-snapshot TTFT = snapshot restore + pipeline startup + playback buffer fill.
+
 | Scenario | Estimated TTFT | Notes |
 |----------|---------------|-------|
-| Same-AZ, 3-frame buffer (current client) | **~310-340ms** | Playback buffer dominates |
-| Same-AZ, 2-frame buffer | **~230-250ms** | Reduce `initialBufferSamples` to 2 frames |
-| Same-AZ, 1-frame buffer | **~155-170ms** | Aggressive, risk of audio underruns |
-| Cross-region, 3-frame buffer | **~450ms** | +100ms round-trip overhead across 3 frames |
+| Same-AZ, 3-frame buffer (current) | **~830-860ms** | 520ms restore + 310-340ms pipeline |
+| Same-AZ, 2-frame buffer | **~750-780ms** | Reduce `initialBufferSamples` to 2 frames |
+| Same-AZ, 1-frame buffer | **~675-695ms** | Aggressive, risk of audio underruns |
+| Cross-region, 3-frame buffer | **~930-960ms** | +100ms round-trip overhead |
+
+> **Note:** These estimates add the measured 520ms restore time (unpinned) to the pipeline latencies estimated earlier in this document. The pipeline estimates (mic capture, encode, network, decode, playback buffer) are unchanged and still not empirically validated end-to-end.
 
 ---
 
-## Comparison: Current vs Estimated With Snapshot
+## Comparison: Before vs After Snapshot
 
-| Phase | Current (measured) | With Snapshot (estimated) |
+| Phase | Before (doc 01, measured) | After (doc 05, measured) |
 |-------|---------|---------------|
-| Prefill (voice+text+silence) | 7,621ms | ~50-200ms (restore) |
-| CUDA graph warmup | 0ms (persists) | 0ms (persists) |
-| Pipeline to first audio | ~310-340ms (estimate) | ~310-340ms (estimate) |
-| **Total handshake-to-audio** | **~7,930ms** | **~360-540ms** |
+| Prefill / Restore | 7,621ms | **520ms (clone+restore, measured, unpinned)** |
+| CUDA graph warmup | 0ms (persists) | 0ms (persists, confirmed) |
+| Pipeline to first audio | ~310-340ms (estimate) | ~310-340ms (estimate, unchanged) |
+| **Total handshake-to-audio** | **~7,930ms** | **~830-860ms (estimated)** |
+
+> **Update (March 16, 2026):** The pre-implementation estimate of 50-200ms for restore underestimated the actual cost. Measured restore is ~520ms unpinned (201ms clone + 299ms CPU→GPU copy + overhead). Pinned memory was ~525ms but caused audio blitzing (see [doc 06](06_pin-memory-audio-blitzing-root-cause.md)). The total estimated TTFT is ~830-860ms — still a **9x improvement** over the 7.9s baseline. See [doc 05](05_kv-cache-snapshot-implementation-results.md) for full measurements.
 
 ---
 

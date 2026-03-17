@@ -144,9 +144,11 @@ CUDA graphs are created once during server startup (`warmup()` runs 4 dummy step
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Prefill time (current cold start) | 7,621ms | Measured (doc 01) |
-| Snapshot size | ~1.5 GB | Calculated from model config |
-| Restore time (GPU VRAM copy) | ~50ms | Estimate |
-| Restore time (CPU RAM to GPU) | ~150-200ms | Estimate |
-| Restore time (NVMe to GPU) | ~500-1000ms | Estimate |
-| **Estimated cold start with pre-warm** | **~200ms** | **Estimate (CPU RAM path)** |
+| Prefill time (without snapshot) | 7,621ms | Measured (doc 01) |
+| Snapshot size | 1.46 GB | Measured (doc 05) |
+| Restore time (CPU RAM to GPU, unpinned) | ~520ms | **Measured (doc 05)** — 201ms clone + 299ms restore |
+| Restore time (GPU VRAM copy) | ~50ms | Estimate (not tested) |
+| Restore time (NVMe to GPU, uncached) | ~3,000-11,000ms | **Measured** — OS page cache eviction makes this unreliable |
+| **Cold start with snapshot restore** | **~520ms** | **Measured (doc 05, unpinned CPU RAM path)** |
+
+> **Update (March 16, 2026):** The CPU RAM restore estimate of 150-200ms in the original version of this document underestimated the actual cost. The measured 520ms includes two phases not anticipated: (1) cloning tensors into a fresh dict (~201ms) because `set_streaming_state_inplace` mutates the input dict, and (2) per-tensor Python dispatch overhead across ~100 individual copy operations (~299ms). Note: `pin_memory()` was tested first (fix 1) but caused audio blitzing; the final implementation uses unpinned `.clone()` (fix 2). Measured restore times are essentially identical between pinned (~525ms) and unpinned (~520ms). See [doc 05](05_kv-cache-snapshot-implementation-results.md) and [doc 06](06_pin-memory-audio-blitzing-root-cause.md).

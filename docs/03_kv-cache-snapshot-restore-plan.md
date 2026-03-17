@@ -26,20 +26,19 @@ Main LM transformer KV cache (the bulk):
 
 ---
 
-## Estimated Restore Speed by Storage Tier
+## Restore Speed by Storage Tier
 
-All restore times are **projections** -- not yet benchmarked.
+| Strategy | Cold Start | Savings vs 7.6s | VRAM Cost | Status |
+|----------|-----------|-----------------|-----------|--------|
+| **GPU VRAM cache** (tensor.copy_) | ~50ms | 99.3% | +1.5 GB per cached config | Estimate (not tested) |
+| **CPU RAM cache** (pinned, clone+copy) | **~525ms** | **93%** | 0 VRAM, +1.5 GB RAM | **Measured** — but causes audio blitzing |
+| **CPU RAM cache** (unpinned, .clone()) | **~520ms** | **93%** | 0 VRAM, +1.5 GB RAM | **Measured (doc 05, final)** |
+| **NVMe SSD** (disk to GPU) | 3,000-11,000ms | Unreliable | 0 | **Measured — not viable for multi-snapshot** |
+| **EBS gp3** (network disk to GPU) | ~1500-3000ms | 60-80% | 0 | Estimate |
 
-| Strategy | Estimated Cold Start | Estimated Savings vs 7.6s | VRAM Cost |
-|----------|---------------------|--------------------------|-----------|
-| **GPU VRAM cache** (tensor.copy_) | ~50ms | 99.3% | +1.5 GB per cached config |
-| **CPU RAM cache** (pinned mem to GPU) | ~150-200ms | 97% | 0 VRAM, +1.5 GB RAM |
-| **NVMe SSD** (disk to GPU) | ~500-1000ms | 87-93% | 0 |
-| **EBS gp3** (network disk to GPU) | ~1500-3000ms | 60-80% | 0 |
+> **Update (March 16, 2026):** The original estimate of 150-200ms for CPU RAM restore did not account for two costs: (1) cloning pinned tensors (~210ms) because `set_streaming_state_inplace` pops keys from the input dict, and (2) per-tensor Python dispatch overhead across ~100 copy operations (~300ms for the actual CPU→GPU transfer). The NVMe tier is not viable for multiple snapshots — the OS page cache (30 GB system) cannot retain 10 × 1.46 GB simultaneously, causing page faults and 3-11s latencies.
 
-The CPU RAM restore estimate of 150-200ms is conservative. At PCIe 4.0 theoretical bandwidth (~32 GB/s), the physical transfer of 1.5 GB takes ~47ms. The 150-200ms range accounts for Python/CUDA synchronization overhead.
-
-**Recommendation:** CPU RAM cache for the best balance -- no extra VRAM consumed, and 150-200ms is well within the target.
+**Updated recommendation:** CPU RAM cache with `.clone()` (unpinned). Pinned and unpinned have essentially identical restore performance (~525ms vs ~520ms), but pinned causes audio blitzing on memory-constrained instances (see [doc 06](06_pin-memory-audio-blitzing-root-cause.md)). 520ms cold start is a 14.7x improvement over 7.6s.
 
 ---
 
@@ -95,54 +94,33 @@ What is NOT captured (and does not need to be):
 
 ## Implementation Steps
 
-### Step 1: Snapshot generation script
+### Step 1: Snapshot generation script — ✅ Done
 
-Create a script (e.g. `generate_snapshot.py`) that:
-1. Loads the model (same as `ServerState.__init__()`)
-2. Calls `streaming_forever(1)` + `warmup()`
-3. Sets voice prompt + text prompt
-4. Runs `step_system_prompts_async()` (the 7.6s prefill)
-5. Calls `lm_gen.save_streaming_state("snapshot.safetensors", "snapshot_metadata.json")`
-6. Also saves the voice_prompt path and text_prompt hash as metadata so we know what config this snapshot is for
+Created `moshi/moshi/generate_snapshot.py`:
+- Uses sync `step_system_prompts()` (not async) — avoids needing an event loop
+- Saves `snapshot.safetensors` + `snapshot_metadata.json` + `snapshot_config.json`
+- Accepts `--label`, `--description`, `--icon` for frontend metadata
 
-### Step 2: Server startup -- pre-load snapshot to CPU RAM
+### Step 2: Server startup -- pre-load snapshot to CPU RAM — ✅ Done
 
-In `ServerState.__init__()` in `server.py`:
-1. After model load + `streaming_forever()` + `warmup()`
-2. Call `load_streaming_state(snapshot_path, metadata_path, device='cpu')`
-3. Pin the CPU tensors for faster GPU transfer: `tensor.pin_memory()`
-4. Store as `self._cached_snapshot`
+In `ServerState.__init__()`:
+- Scans `snapshot_dir` and subdirectories for snapshot files
+- Loads each via `load_streaming_state()`, clones into heap RAM via `.clone()` (fix 1 used `pin_memory()` but caused audio blitzing — see [doc 06](06_pin-memory-audio-blitzing-root-cause.md))
+- Indexes by `{voice_prompt}:{text_prompt_hash}` for O(1) lookup
+- Multiple snapshots supported
 
-### Step 3: Per-session fast restore
+### Step 3: Per-session fast restore — ✅ Done
 
-In `handle_chat()` in `server.py`, replace the current flow:
+In `handle_chat()`:
+- Looks up snapshot by incoming `voice_prompt` + SHA-256 of `text_prompt`
+- Clone from CPU RAM + `set_streaming_state_inplace()` (~520ms measured, unpinned)
+- Falls back to full prefill on cache miss
 
-**Current** (lines ~155-185):
-```python
-self.mimi.reset_streaming()
-self.other_mimi.reset_streaming()
-self.lm_gen.reset_streaming()
-await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)  # 7.6s
-self.mimi.reset_streaming()
-```
+### Step 4: Handle config matching — ✅ Done
 
-**New** (with snapshot):
-```python
-self.mimi.reset_streaming()
-self.other_mimi.reset_streaming()
-self.lm_gen.reset_streaming()
-# Deep-copy snapshot to avoid mutating the cached version
-snapshot_copy = {k: v.clone() for k, v in self._cached_snapshot.items()}
-self.lm_gen.set_streaming_state_inplace(snapshot_copy)  # estimated ~200ms
-self.mimi.reset_streaming()
-```
-
-### Step 4: Handle config matching
-
-The snapshot is only valid for a specific (voice_prompt, text_prompt) pair. Add logic to:
-- Check if the requested config matches the cached snapshot
-- Fall back to full prefill if no matching snapshot exists
-- Optionally support multiple cached snapshots keyed by config hash
+- Cache key: `{voice_filename}:{sha256(text_prompt)}`
+- Automatic fallback to full prefill if no matching snapshot exists
+- `/api/scenarios` endpoint exposes available snapshots to the frontend
 
 ---
 

@@ -15,19 +15,17 @@ class MoshiProcessor extends AudioWorkletProcessor {
 
     // Buffer length definitions
     let frameSize = asSamples(80);
-    // initialBufferSamples: we wait to have at least that many samples before starting to play
-    this.initialBufferSamples = 1 * frameSize;
-    // once we have enough samples, we further wait that long before starting to play.
-    // This allows to have buffer lengths that are not a multiple of frameSize.
-    this.partialBufferSamples = asSamples(10);
-    // If the buffer length goes over that many, we will drop the oldest packets until
-    // we reach back initialBufferSamples + partialBufferSamples.
-    this.maxBufferSamples = asSamples(10);
-    // increments
-    this.partialBufferIncrement = asSamples(5);
-    this.maxPartialWithIncrements = asSamples(80);
-    this.maxBufferSamplesIncrement = asSamples(5);
-    this.maxMaxBufferWithIncrements = asSamples(80);
+    // Buffer 3 frames (240ms) before starting playback to absorb GPU timing jitter
+    this.initialBufferSamples = 3 * frameSize;
+    // Additional partial buffer before playback resumes after an underrun
+    this.partialBufferSamples = asSamples(40);
+    // Drop oldest packets only when buffer exceeds this + initial + partial (~440ms total)
+    this.maxBufferSamples = asSamples(160);
+    // Increments when underruns/overflows occur
+    this.partialBufferIncrement = asSamples(10);
+    this.maxPartialWithIncrements = asSamples(160);
+    this.maxBufferSamplesIncrement = asSamples(10);
+    this.maxMaxBufferWithIncrements = asSamples(240);
 
     // State and metrics
     this.initState();
@@ -94,8 +92,8 @@ class MoshiProcessor extends AudioWorkletProcessor {
     this.pidx = 0;
 
     // For now let's reset the buffer params.
-    this.partialBufferSamples = asSamples(10);
-    this.maxBufferSamples = asSamples(10);
+    this.partialBufferSamples = asSamples(40);
+    this.maxBufferSamples = asSamples(160);
   }
 
   totalMaxBufferSamples() {

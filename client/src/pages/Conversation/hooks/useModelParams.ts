@@ -9,7 +9,7 @@ export const DEFAULT_PAD_MULT = 0;
 export const DEFAULT_REPETITION_PENALTY_CONTEXT = 64;
 export const DEFAULT_REPETITION_PENALTY = 1.0;
 export const DEFAULT_TEXT_PROMPT = "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.";
-export const DEFAULT_VOICE_PROMPT = "NATF0.pt";
+export const DEFAULT_VOICE_PROMPT = "NATM1.pt";
 export const DEFAULT_RANDOM_SEED = -1;
 
 export type ModelParamsValues = {
